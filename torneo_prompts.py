@@ -22,6 +22,11 @@ DURACION_MINUTOS = 5
 # Cada cuántos segundos se busca una pregunta activa en la pantalla de espera
 ESPERA_SEGUNDOS = 3
 
+# Segundos sin "latido" para considerar abandonada una sesión de equipo
+# (la app renueva el candado cada segundo; si un navegador se cierra a la
+# fuerza, otro integrante podrá entrar después de este tiempo)
+TTL_SESION_SEG = 180
+
 
 # ==============================================================================
 # FUNCIONES AUXILIARES
@@ -36,6 +41,61 @@ def obtener_fecha_hora_mexico():
 def ahora_mexico():
     """Retorna el objeto datetime completo (para calcular el temporizador)."""
     return datetime.now(timezone(timedelta(hours=-6)))
+
+
+def ahora_mexico_bd():
+    """Hora de México SIN tzinfo, lista para guardar en la base de datos."""
+    return datetime.now(timezone(timedelta(hours=-6))).replace(tzinfo=None)
+
+
+def sesion_equipo_activa(engine, equipo):
+    """True si el equipo ya tiene una sesión viva (latido reciente)."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text('SELECT hora_inicio FROM YahSesionEquipo WHERE equipo = :e'),
+                {'e': equipo},
+            ).fetchone()
+        if row is None or row.hora_inicio is None:
+            return False
+        inicio = row.hora_inicio.replace(tzinfo=timezone(timedelta(hours=-6)))
+        return (ahora_mexico() - inicio).total_seconds() <= TTL_SESION_SEG
+    except Exception:
+        return False  # si la tabla no existe, no bloqueamos (modo compatibilidad)
+
+
+def registrar_sesion_equipo(engine, equipo, idalumno):
+    """Pone el candado del equipo (elimina cualquier candado previo)."""
+    with engine.begin() as conn:
+        conn.execute(text('DELETE FROM YahSesionEquipo WHERE equipo = :e'),
+                     {'e': equipo})
+        conn.execute(
+            text('INSERT INTO YahSesionEquipo (equipo, idalumno, hora_inicio) '
+                 'VALUES (:e, :a, :h)'),
+            {'e': equipo, 'a': str(idalumno), 'h': ahora_mexico_bd()},
+        )
+
+
+def latido_sesion(engine, equipo):
+    """Renueva el candado; la app lo llama cada pocos segundos."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text('UPDATE YahSesionEquipo SET hora_inicio = :h WHERE equipo = :e'),
+                {'h': ahora_mexico_bd(), 'e': equipo},
+            )
+    except Exception:
+        pass
+
+
+def liberar_sesion(engine, equipo):
+    """Quita el candado (al guardar, salir o quedarse sin tiempo)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text('DELETE FROM YahSesionEquipo WHERE equipo = :e'),
+                         {'e': equipo})
+    except Exception:
+        pass
 
 
 # ==============================================================================
@@ -70,6 +130,7 @@ def app_torneo():
     if st.session_state['hora_inicio'] is not None:
         tiempo_limite = st.session_state['hora_inicio'] + timedelta(minutes=DURACION_MINUTOS)
         if ahora_mexico() >= tiempo_limite:
+            liberar_sesion(engine, int(st.session_state['equipo']))
             st.error(
                 '⏰ **¡Tiempo agotado!**\n\n'
                 'Los 5 minutos han terminado. Cierra esta pestaña.'
@@ -158,15 +219,35 @@ def app_torneo():
                                 ).fetchone()
 
                             if res:
-                                # Contraseña correcta -> pasa a la sala de espera.
-                                # NO se sortea pregunta aquí: se sortea cuando
-                                # el administrador active una (estatus = 1).
-                                st.session_state['autenticado'] = True
-                                st.session_state['esperando'] = True
-                                st.session_state['idalumno'] = res.idalumno
-                                st.session_state['nombre'] = res.nombre
-                                st.session_state['equipo'] = res.equipo
-                                st.rerun()
+                                # Candado por equipo: si otro integrante del
+                                # mismo equipo ya tiene sesión viva, se rechaza.
+                                equipo_int = int(res.equipo)
+                                if sesion_equipo_activa(engine, equipo_int):
+                                    st.error(
+                                        '❌ Tu equipo ya tiene una sesión '
+                                        'activa con otro integrante. Termina '
+                                        'esa sesión (botón Salir) o espera '
+                                        f'{TTL_SESION_SEG // 60} minutos si se '
+                                        'quedó abierta, e intenta de nuevo.'
+                                    )
+                                else:
+                                    try:
+                                        registrar_sesion_equipo(
+                                            engine, equipo_int, res.idalumno)
+                                    except Exception as err:
+                                        st.warning(
+                                            '⚠️ No se pudo registrar la sesión '
+                                            'del equipo (¿existe la tabla '
+                                            f'YahSesionEquipo?): {err}')
+                                    # Contraseña correcta -> sala de espera.
+                                    # NO se sortea pregunta aquí: se sortea
+                                    # cuando el admin active una (estatus = 1).
+                                    st.session_state['autenticado'] = True
+                                    st.session_state['esperando'] = True
+                                    st.session_state['idalumno'] = res.idalumno
+                                    st.session_state['nombre'] = res.nombre
+                                    st.session_state['equipo'] = res.equipo
+                                    st.rerun()
                             else:
                                 st.error('❌ Contraseña incorrecta. Vuelve a intentar.')
                         except Exception as err:
@@ -192,6 +273,7 @@ def app_torneo():
             st.caption(f'🔄 Última actualización: **{hora_actual}**')
         with col_salir:
             if st.button('🔒 Salir', use_container_width=True):
+                liberar_sesion(engine, int(st.session_state['equipo']))
                 for clave in defaults:
                     st.session_state[clave] = defaults[clave]
                 st.rerun()
@@ -232,6 +314,8 @@ def app_torneo():
         except Exception as err:
             st.error(f'⚠️ Error al buscar la pregunta: {err}')
 
+        # Latido: mantiene vivo el candado del equipo
+        latido_sesion(engine, int(st.session_state['equipo']))
         time.sleep(ESPERA_SEGUNDOS)
         st.rerun()
 
@@ -318,6 +402,9 @@ def app_torneo():
                         },
                     )
 
+                # La ronda terminó para este equipo: liberar el candado
+                liberar_sesion(engine, int(st.session_state['equipo']))
+
                 # Pantalla de confirmación y cierre limpio de sesión
                 st.success(
                     '✅ **¡Respuesta guardada con éxito!**\n\n'
@@ -352,6 +439,9 @@ def app_torneo():
 
             except Exception as err:
                 st.error(f'⚠️ Error al guardar la respuesta: {err}')
+
+    # Latido: mantiene vivo el candado del equipo mientras trabaja
+    latido_sesion(engine, int(st.session_state['equipo']))
 
     # E. Refresco automático para que el temporizador corra segundo a segundo
     time.sleep(1)
